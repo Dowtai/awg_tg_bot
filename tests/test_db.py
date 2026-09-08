@@ -41,6 +41,23 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual((server["id"], server["name"]), (1, "default"))
                 self.assertEqual((peer["id"], peer["server_id"], peer["telegram_id"]), (7, 1, 42))
 
+    def test_deleting_server_cascades_peers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "bot.sqlite3")
+            with database.connect() as db:
+                server_id = db.execute("""
+                    INSERT INTO servers(name,host,port,username,password_enc,endpoint,config_json)
+                    VALUES('test','host',22,'root',X'00','203.0.113.1','{}')
+                """).lastrowid
+                db.execute("""
+                    INSERT INTO peers(server_id,telegram_id,name,address,public_key)
+                    VALUES(?,42,'phone','10.0.0.2','public')
+                """, (server_id,))
+            with database.connect() as db:
+                db.execute("DELETE FROM servers WHERE id=?", (server_id,))
+            with database.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM peers").fetchone()[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

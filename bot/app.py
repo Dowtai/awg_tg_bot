@@ -12,7 +12,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from .config import Settings
 from .crypto import Vault
 from .db import Database
-from .remote import Credentials, add_peer, install, remove_peer
+from .remote import Credentials, add_peer, delete_deployment, install, remove_peer
 from .vpnurl import encode_vpn_url, guest_payload
 
 SERVER_NAME, HOST, USER, PASSWORD = range(4)
@@ -35,7 +35,7 @@ class Bot:
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "/newkey [имя] — выбрать сервер и создать vpn:// профиль\n/servers — список серверов"
         if self.owner(update):
-            text += "\n/server — добавить сервер\n/cancel — прервать настройку\n/allow ID — разрешить пользователя\n/deny ID — удалить пользователя и отозвать его ключи\n/users — список разрешённых"
+            text += "\n/server — добавить сервер\n/delserver — удалить сервер\n/cancel — прервать настройку\n/allow ID — разрешить пользователя\n/deny ID — удалить пользователя и отозвать его ключи\n/users — список разрешённых"
         await update.message.reply_text(text)
 
     async def server_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -157,6 +157,67 @@ class Bot:
             lines.append(f"{row['name']} · {row['host']} · UDP {cfg['port']} · {cfg['subnet']}")
         await update.message.reply_text("\n".join(lines))
 
+    async def delserver(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.owner(update):
+            return
+        with self.db.connect() as db:
+            servers = db.execute("SELECT id,name FROM servers ORDER BY name COLLATE NOCASE").fetchall()
+        if not servers:
+            await update.message.reply_text("Серверов нет.")
+            return
+        keyboard = [[InlineKeyboardButton(row["name"], callback_data=f"delserver:{row['id']}")] for row in servers]
+        await update.message.reply_text("Какой сервер удалить?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def delserver_selected(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        if query.from_user.id != self.s.owner_id:
+            await query.edit_message_text("Операция доступна только owner.")
+            return
+        server_id = int(query.data.split(":", 1)[1])
+        with self.db.connect() as db:
+            server = db.execute("SELECT name FROM servers WHERE id=?", (server_id,)).fetchone()
+        if not server:
+            await query.edit_message_text("Сервер уже удалён.")
+            return
+        keyboard = [[
+            InlineKeyboardButton("Удалить безвозвратно", callback_data=f"confirmdel:{server_id}"),
+            InlineKeyboardButton("Отмена", callback_data="canceldel"),
+        ]]
+        await query.edit_message_text(
+            f"Удалить сервер «{server['name']}», его контейнер на VPS и все выданные ключи?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    async def delserver_confirmed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        if query.from_user.id != self.s.owner_id:
+            await query.edit_message_text("Операция доступна только owner.")
+            return
+        server_id = int(query.data.split(":", 1)[1])
+        with self.db.connect() as db:
+            row = db.execute("SELECT name FROM servers WHERE id=?", (server_id,)).fetchone()
+        loaded = self.load_server(server_id)
+        if not row or not loaded:
+            await query.edit_message_text("Сервер уже удалён.")
+            return
+        await query.edit_message_text(f"Удаляю сервер «{row['name']}»…")
+        try:
+            credentials, (cfg, _) = loaded
+            await delete_deployment(credentials, cfg)
+            with self.db.connect() as db:
+                db.execute("DELETE FROM servers WHERE id=?", (server_id,))
+            await query.edit_message_text(f"Сервер «{row['name']}» и связанные ключи удалены.")
+        except Exception as error:
+            log.exception("server deletion failed")
+            await query.edit_message_text(f"Не удалось удалить сервер: {error}")
+
+    async def delserver_cancelled(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text("Удаление отменено.")
+
     def load_server(self, server_id: int):
         with self.db.connect() as db: r = db.execute("SELECT * FROM servers WHERE id=?", (server_id,)).fetchone()
         if not r: return None
@@ -241,6 +302,9 @@ def main():
         states={SERVER_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND,bot.server_name)], HOST:[MessageHandler(filters.TEXT & ~filters.COMMAND,bot.server_host)], USER:[MessageHandler(filters.TEXT & ~filters.COMMAND,bot.server_user)], PASSWORD:[MessageHandler(filters.TEXT & ~filters.COMMAND,bot.server_password)]},
         fallbacks=[CommandHandler("cancel",bot.cancel)], allow_reentry=True))
     app.add_handler(CallbackQueryHandler(bot.newkey_server, pattern=r"^newkey:\d+$"))
-    for command, fn in (("start",bot.start),("help",bot.help),("allow",bot.allow),("deny",bot.deny),("users",bot.users),("servers",bot.servers),("newkey",bot.newkey)):
+    app.add_handler(CallbackQueryHandler(bot.delserver_selected, pattern=r"^delserver:\d+$"))
+    app.add_handler(CallbackQueryHandler(bot.delserver_confirmed, pattern=r"^confirmdel:\d+$"))
+    app.add_handler(CallbackQueryHandler(bot.delserver_cancelled, pattern=r"^canceldel$"))
+    for command, fn in (("start",bot.start),("help",bot.help),("allow",bot.allow),("deny",bot.deny),("users",bot.users),("servers",bot.servers),("delserver",bot.delserver),("newkey",bot.newkey)):
         app.add_handler(CommandHandler(command,fn))
     app.run_polling(allowed_updates=Update.ALL_TYPES)

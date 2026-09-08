@@ -1,8 +1,8 @@
 import ipaddress
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from bot.remote import _free_port, _free_subnet, config_path, container_name, interface_name
+from bot.remote import _free_port, _free_subnet, config_path, container_name, delete_deployment_sync, interface_name
 
 
 class RemoteSelectionTests(unittest.TestCase):
@@ -24,6 +24,22 @@ class RemoteSelectionTests(unittest.TestCase):
         self.assertEqual(container_name(server), "awg-bot-abcd")
         self.assertEqual(interface_name(server), "awgabcd")
         self.assertEqual(config_path(server), "/opt/awg-bot/abcd/data/awgabcd.conf")
+
+    @patch("bot.remote.sudo_run")
+    @patch("bot.remote.connect", return_value=(MagicMock(), "fingerprint"))
+    def test_delete_new_deployment_removes_only_exact_instance(self, _connect, sudo):
+        server = {"deployment_id": "1234abcd", "remote_dir": "/opt/awg-bot/1234abcd",
+                  "container": "awg-bot-1234abcd", "interface": "awg1234a"}
+        delete_deployment_sync(type("Credentials", (), {"password": "secret"})(), server)
+        command = sudo.call_args.args[2]
+        self.assertIn("rm -rf -- /opt/awg-bot/1234abcd", command)
+
+    @patch("bot.remote.sudo_run")
+    @patch("bot.remote.connect", return_value=(MagicMock(), "fingerprint"))
+    def test_delete_legacy_does_not_recursively_remove_shared_root(self, _connect, sudo):
+        delete_deployment_sync(type("Credentials", (), {"password": "secret"})(), {})
+        command = sudo.call_args.args[2]
+        self.assertNotIn("rm -rf", command)
 
 
 if __name__ == "__main__":

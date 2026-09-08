@@ -285,3 +285,39 @@ def remove_peer_sync(c: Credentials, server: dict, public: str):
 
 async def remove_peer(c, server, public):
     return await asyncio.to_thread(remove_peer_sync, c, server, public)
+
+
+def delete_deployment_sync(c: Credentials, server: dict):
+    container = container_name(server)
+    iface = interface_name(server)
+    root = remote_dir(server)
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]+", container):
+        raise ValueError("Некорректное имя контейнера в конфигурации")
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]+", iface):
+        raise ValueError("Некорректное имя интерфейса в конфигурации")
+    client, _ = connect(c)
+    try:
+        cleanup = (
+            f"docker rm -f {shlex.quote(container)} >/dev/null 2>&1 || true\n"
+            f"docker image rm {shlex.quote(container)} >/dev/null 2>&1 || true\n"
+            f"ip link delete {shlex.quote(iface)} >/dev/null 2>&1 || true\n"
+        )
+        deployment_id = server.get("deployment_id")
+        expected_root = f"/opt/awg-bot/{deployment_id}" if deployment_id else None
+        if expected_root and root == expected_root and re.fullmatch(r"[0-9a-f]{8}", deployment_id):
+            cleanup += f"rm -rf -- {shlex.quote(root)}\n"
+        else:
+            # Legacy installation used /opt/awg-bot as a shared root. Remove only
+            # known files so newer deployment subdirectories cannot be affected.
+            cleanup += (
+                f"rm -f -- {shlex.quote(root + '/Dockerfile')} {shlex.quote(root + '/start.sh')} "
+                f"{shlex.quote(config_path(server))}\n"
+                f"rmdir -- {shlex.quote(root + '/data')} {shlex.quote(root)} >/dev/null 2>&1 || true\n"
+            )
+        sudo_run(client, c.password, cleanup)
+    finally:
+        client.close()
+
+
+async def delete_deployment(c, server):
+    return await asyncio.to_thread(delete_deployment_sync, c, server)

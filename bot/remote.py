@@ -4,6 +4,8 @@ import base64
 import hashlib
 import ipaddress
 import json
+import re
+import secrets
 import shlex
 import textwrap
 import threading
@@ -13,8 +15,8 @@ from typing import Callable
 import paramiko
 
 
-REMOTE_DIR = "/opt/awg-bot"
-CONTAINER = "awg-bot-server"
+LEGACY_REMOTE_DIR = "/opt/awg-bot"
+LEGACY_CONTAINER = "awg-bot-server"
 
 
 @dataclass
@@ -76,6 +78,58 @@ def _random_params(client: paramiko.SSHClient, password: str) -> dict:
             "H3": str(int(nums[2]) or 103), "H4": str(int(nums[3]) or 104)}
 
 
+def _free_port(client: paramiko.SSHClient) -> int:
+    listeners = run(client, "ss -H -lun 2>/dev/null || true")
+    used = {int(value) for value in re.findall(r":(\d{1,5})(?:\s|$)", listeners)}
+    choices = list(range(50000, 60000))
+    secrets.SystemRandom().shuffle(choices)
+    for port in choices:
+        if port not in used:
+            return port
+    raise RuntimeError("На VPS нет свободного UDP-порта в диапазоне 50000–59999")
+
+
+def _free_subnet(client: paramiko.SSHClient, password: str) -> ipaddress.IPv4Network:
+    output = run(client, "ip -4 route show || true") + "\n" + sudo_run(
+        client, password,
+        "docker network inspect $(docker network ls -q) --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null || true",
+    )
+    occupied = []
+    for value in re.findall(r"(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}", output):
+        try:
+            occupied.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            pass
+    candidates = (
+        [ipaddress.ip_network(f"10.{second}.{third}.0/24")
+         for second in range(0, 256) for third in range(0, 256)]
+        + [ipaddress.ip_network(f"172.{second}.{third}.0/24")
+           for second in range(16, 32) for third in range(0, 256)]
+        + [ipaddress.ip_network(f"192.168.{third}.0/24") for third in range(0, 256)]
+    )
+    secrets.SystemRandom().shuffle(candidates)
+    for candidate in candidates:
+        if not any(candidate.overlaps(network) for network in occupied):
+            return candidate
+    raise RuntimeError("Не удалось подобрать свободную приватную /24-подсеть")
+
+
+def remote_dir(server: dict) -> str:
+    return server.get("remote_dir", LEGACY_REMOTE_DIR)
+
+
+def container_name(server: dict) -> str:
+    return server.get("container", LEGACY_CONTAINER)
+
+
+def interface_name(server: dict) -> str:
+    return server.get("interface", "awg0")
+
+
+def config_path(server: dict) -> str:
+    return f"{remote_dir(server)}/data/{interface_name(server)}.conf"
+
+
 def install_sync(c: Credentials, settings: dict, progress: Callable[[str], None]) -> tuple[dict, str]:
     progress("Подключение по SSH")
     client, host_key = connect(c)
@@ -87,24 +141,33 @@ def install_sync(c: Credentials, settings: dict, progress: Callable[[str], None]
 if ! command -v docker >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y docker.io
+  apt-get install -y docker.io iproute2
+fi
+if ! command -v ss >/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y iproute2
 fi
 systemctl enable --now docker 2>/dev/null || true
-mkdir -p /opt/awg-bot/data
-chmod 700 /opt/awg-bot/data
 """
         sudo_run(client, c.password, install)
         progress("Генерация серверных параметров")
         p = _random_params(client, c.password)
-        subnet = ipaddress.ip_network(settings["subnet"])
+        port = _free_port(client)
+        subnet = _free_subnet(client, c.password)
         server_ip = str(next(subnet.hosts()))
-        config = {**p, "subnet": settings["subnet"], "server_ip": server_ip,
-                  "port": settings["port"], "dns": settings["dns"],
+        deployment_id = secrets.token_hex(4)
+        iface = f"awg{deployment_id[:5]}"
+        config = {**p, "subnet": str(subnet), "server_ip": server_ip,
+                  "port": port, "dns": settings["dns"],
+                  "deployment_id": deployment_id,
+                  "remote_dir": f"/opt/awg-bot/{deployment_id}",
+                  "container": f"awg-bot-{deployment_id}", "interface": iface,
                   "Jc": "6", "Jmin": "10", "Jmax": "50",
                   "S1": "76", "S2": "47", "S3": "33", "S4": "12",
                   "ContentPaddingAddition": "10-100", "RandomTrailers": "on", "DisableCookies": "on"}
         dockerfile = textwrap.dedent(f"""
-          FROM golang:1.24-alpine AS go
+          FROM golang:1.25.12-alpine AS go
           RUN apk add --no-cache git make
           RUN git clone --depth 1 --branch {settings['go_ref']} https://github.com/amnezia-vpn/amneziawg-go /src
           WORKDIR /src
@@ -117,31 +180,33 @@ chmod 700 /opt/awg-bot/data
           RUN chmod +x /start.sh
           ENTRYPOINT ["/usr/bin/dumb-init","--","/start.sh"]
         """).strip() + "\n"
-        start = textwrap.dedent("""
+        start = textwrap.dedent(f"""
           #!/bin/bash
           set -euo pipefail
           export WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
-          awg-quick up /data/awg0.conf
-          trap 'awg-quick down /data/awg0.conf || true' EXIT TERM INT
-          awg show awg0
+          awg-quick up /data/{iface}.conf
+          trap 'awg-quick down /data/{iface}.conf || true' EXIT TERM INT
+          awg show {iface}
           tail -f /dev/null & wait $!
         """).strip() + "\n"
         conf = render_server_config(config)
         progress("Загрузка конфигурации на VPS")
-        for path, body in (("Dockerfile", dockerfile), ("start.sh", start), ("data/awg0.conf", conf)):
+        root = remote_dir(config)
+        sudo_run(client, c.password, f"mkdir -p {root}/data; chmod 700 {root}/data")
+        for path, body in (("Dockerfile", dockerfile), ("start.sh", start), (f"data/{iface}.conf", conf)):
             encoded = base64.b64encode(body.encode()).decode()
-            sudo_run(client, c.password, f"printf %s {shlex.quote(encoded)} | base64 -d > {REMOTE_DIR}/{path}")
-        sudo_run(client, c.password, f"chmod 600 {REMOTE_DIR}/data/awg0.conf")
+            sudo_run(client, c.password, f"printf %s {shlex.quote(encoded)} | base64 -d > {root}/{path}")
+        sudo_run(client, c.password, f"chmod 600 {config_path(config)}")
         progress("Сборка AmneziaWG 3.1 (может занять несколько минут)")
-        sudo_run(client, c.password, f"cd {REMOTE_DIR} && docker build --pull -t awg-bot-server .", timeout=1800)
+        sudo_run(client, c.password, f"cd {root} && docker build --pull -t {container_name(config)} .", timeout=1800)
         progress("Запуск VPN-контейнера")
         sudo_run(client, c.password, "sysctl -w net.ipv4.ip_forward=1 >/dev/null; "
                     "printf 'net.ipv4.ip_forward=1\\n' > /etc/sysctl.d/99-awg-bot.conf; "
-                    f"docker rm -f {CONTAINER} >/dev/null 2>&1 || true; "
-                    f"docker run -d --name {CONTAINER} --restart unless-stopped --privileged "
-                    f"--network host -v {REMOTE_DIR}/data:/data awg-bot-server")
+                    f"docker rm -f {container_name(config)} >/dev/null 2>&1 || true; "
+                    f"docker run -d --name {container_name(config)} --restart unless-stopped --privileged "
+                    f"--network host -v {root}/data:/data {container_name(config)}")
         progress("Проверка интерфейса и UDP-порта")
-        sudo_run(client, c.password, f"for i in $(seq 1 20); do docker exec {CONTAINER} awg show awg0 >/dev/null 2>&1 && exit 0; sleep 1; done; docker logs {CONTAINER}; exit 1")
+        sudo_run(client, c.password, f"for i in $(seq 1 20); do docker exec {container_name(config)} awg show {iface} >/dev/null 2>&1 && exit 0; sleep 1; done; docker logs {container_name(config)}; exit 1")
         return config, host_key
     finally:
         client.close()
@@ -172,8 +237,8 @@ HeaderProtectionKey = {c['header_key']}
 ContentPaddingAddition = {c['ContentPaddingAddition']}
 RandomTrailers = {c['RandomTrailers']}
 DisableCookies = {c['DisableCookies']}
-PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s {c['subnet']} -o $(ip route show default | awk '{{print $5; exit}}') -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s {c['subnet']} -o $(ip route show default | awk '{{print $5; exit}}') -j MASQUERADE
+PostUp = iptables -I INPUT -p udp --dport {c['port']} -j ACCEPT; iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s {c['subnet']} -o $(ip route show default | awk '{{print $5; exit}}') -j MASQUERADE
+PostDown = iptables -D INPUT -p udp --dport {c['port']} -j ACCEPT; iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s {c['subnet']} -o $(ip route show default | awk '{{print $5; exit}}') -j MASQUERADE
 {peers}"""
 
 
@@ -185,13 +250,16 @@ def add_peer_sync(c: Credentials, server: dict, address: str, name: str) -> dict
     with lock:
         client, _ = connect(c)
         try:
-            private = sudo_run(client, c.password, f"docker exec {CONTAINER} awg genkey")
-            public = sudo_run(client, c.password, f"printf %s {shlex.quote(private)} | docker exec -i {CONTAINER} awg pubkey")
-            psk = sudo_run(client, c.password, f"docker exec {CONTAINER} awg genpsk")
+            container = container_name(server)
+            iface = interface_name(server)
+            path = config_path(server)
+            private = sudo_run(client, c.password, f"docker exec {container} awg genkey")
+            public = sudo_run(client, c.password, f"printf %s {shlex.quote(private)} | docker exec -i {container} awg pubkey")
+            psk = sudo_run(client, c.password, f"docker exec {container} awg genpsk")
             block = f"\n# bot:{name}\n[Peer]\nPublicKey = {public}\nPresharedKey = {psk}\nAllowedIPs = {address}/32\n"
             encoded = base64.b64encode(block.encode()).decode()
-            sudo_run(client, c.password, f"printf %s {shlex.quote(encoded)} | base64 -d >> {REMOTE_DIR}/data/awg0.conf; "
-                        f"docker exec {CONTAINER} bash -lc 'awg syncconf awg0 <(awg-quick strip /data/awg0.conf)'")
+            sudo_run(client, c.password, f"printf %s {shlex.quote(encoded)} | base64 -d >> {path}; "
+                        f"docker exec {container} bash -lc 'awg syncconf {iface} <(awg-quick strip /data/{iface}.conf)'")
             return {"private": private, "public": public, "psk": psk, "address": address}
         finally:
             client.close()
@@ -201,17 +269,19 @@ async def add_peer(c, server, address, name):
     return await asyncio.to_thread(add_peer_sync, c, server, address, name)
 
 
-def remove_peer_sync(c: Credentials, public: str):
+def remove_peer_sync(c: Credentials, server: dict, public: str):
     client, _ = connect(c)
     try:
-        sudo_run(client, c.password, f"docker exec {CONTAINER} awg set awg0 peer {shlex.quote(public)} remove")
+        container = container_name(server)
+        iface = interface_name(server)
+        sudo_run(client, c.password, f"docker exec {container} awg set {iface} peer {shlex.quote(public)} remove")
         # Persist by removing the matching Peer stanza using a small container-side awk program.
-        script = """awk -v key="$1" 'BEGIN{RS=""; ORS="\n\n"} index($0, "PublicKey = " key) == 0' /data/awg0.conf > /data/awg0.new && mv /data/awg0.new /data/awg0.conf && chmod 600 /data/awg0.conf"""
+        script = f"""awk -v key="$1" 'BEGIN{{RS=""; ORS="\n\n"}} index($0, "PublicKey = " key) == 0' /data/{iface}.conf > /data/{iface}.new && mv /data/{iface}.new /data/{iface}.conf && chmod 600 /data/{iface}.conf"""
         enc = base64.b64encode(script.encode()).decode()
-        sudo_run(client, c.password, f"printf %s {shlex.quote(enc)} | base64 -d | docker exec -i {CONTAINER} sh -s -- {shlex.quote(public)}")
+        sudo_run(client, c.password, f"printf %s {shlex.quote(enc)} | base64 -d | docker exec -i {container} sh -s -- {shlex.quote(public)}")
     finally:
         client.close()
 
 
-async def remove_peer(c, public):
-    return await asyncio.to_thread(remove_peer_sync, c, public)
+async def remove_peer(c, server, public):
+    return await asyncio.to_thread(remove_peer_sync, c, server, public)

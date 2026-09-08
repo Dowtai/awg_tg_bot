@@ -13,7 +13,7 @@ from .config import Settings
 from .crypto import Vault
 from .db import Database
 from .remote import Credentials, add_peer, delete_deployment, install, remove_peer
-from .vpnurl import encode_vpn_url, guest_payload
+from .vpnurl import admin_payload, encode_vpn_url, guest_payload
 
 SERVER_NAME, HOST, USER, PASSWORD = range(4)
 log = logging.getLogger(__name__)
@@ -98,9 +98,27 @@ class Bot:
                     cursor = db.execute("INSERT INTO servers(name,host,port,username,password_enc,host_key,endpoint,config_json) VALUES(?,?,?,?,?,?,?,?)",
                                (context.user_data["server_name"],c.host,c.port,c.username,self.vault.encrypt(password),host_key,endpoint_ip,json.dumps(cfg)))
                     server_id = cursor.lastrowid
-                key = await self.issue_key(update.effective_user.id, "owner", server_id)
+                key = await self.issue_key(
+                    update.effective_user.id, "owner", server_id,
+                    admin_credentials=c,
+                    admin_description=context.user_data["server_name"],
+                )
+                # Claim the only administrative export before sending it. If
+                # Telegram delivery fails, the secret is never sent twice.
+                with self.db.connect() as db:
+                    changed = db.execute(
+                        "UPDATE servers SET admin_profile_issued_at=CURRENT_TIMESTAMP "
+                        "WHERE id=? AND admin_profile_issued_at IS NULL",
+                        (server_id,),
+                    ).rowcount
+                if changed != 1:
+                    raise RuntimeError("Административный профиль уже был выдан")
                 await status.edit_text(f"Установка завершена. Сервер: {context.user_data['server_name']}\nUDP-порт: {cfg['port']}\nПодсеть: {cfg['subnet']}")
-                await update.effective_chat.send_message("Администраторский VPN-профиль (управление сервером остаётся в боте):")
+                await update.effective_chat.send_message(
+                    "Первый и единственный административный VPN-профиль. Он содержит SSH-пароль, "
+                    "даёт полный доступ к серверу через AmneziaVPN и повторно ботом не выдаётся. "
+                    "Сохраните его в защищённом месте и удалите сообщение после импорта."
+                )
                 await update.effective_chat.send_message(key)
         except Exception as e:
             log.exception("installation failed")
@@ -230,14 +248,32 @@ class Bot:
                 db.execute("UPDATE servers SET endpoint=? WHERE id=?", (endpoint, server_id))
         return Credentials(r["host"],r["port"],r["username"],self.vault.decrypt(r["password_enc"]),r["host_key"]), (json.loads(r["config_json"]),endpoint)
 
-    async def issue_key(self, uid: int, name: str, server_id: int) -> str:
+    async def issue_key(
+        self, uid: int, name: str, server_id: int,
+        admin_credentials: Credentials | None = None,
+        admin_description: str | None = None,
+    ) -> str:
         async with self.peer_lock:
-            return await self._issue_key(uid, name, server_id)
+            return await self._issue_key(
+                uid, name, server_id, admin_credentials, admin_description
+            )
 
-    async def _issue_key(self, uid: int, name: str, server_id: int) -> str:
+    async def _issue_key(
+        self, uid: int, name: str, server_id: int,
+        admin_credentials: Credentials | None = None,
+        admin_description: str | None = None,
+    ) -> str:
         loaded = self.load_server(server_id)
         if not loaded: raise RuntimeError("Выбранный сервер не найден")
         c, (cfg, endpoint) = loaded
+        if admin_credentials is not None:
+            with self.db.connect() as db:
+                issued = db.execute(
+                    "SELECT admin_profile_issued_at FROM servers WHERE id=?",
+                    (server_id,),
+                ).fetchone()
+            if not issued or issued["admin_profile_issued_at"] is not None:
+                raise RuntimeError("Административный профиль уже был выдан")
         network = ipaddress.ip_network(cfg["subnet"])
         with self.db.connect() as db:
             used = {ipaddress.ip_address(r[0]) for r in db.execute("SELECT address FROM peers WHERE server_id=? AND revoked_at IS NULL", (server_id,))}
@@ -250,7 +286,24 @@ class Bot:
                        "client_pub_key":peer["public"], "server_pub_key":cfg["server_public"], "psk_key":peer["psk"],
                        "hostName":endpoint,"port":int(cfg["port"]),"transport_proto":"udp","mtu":"1376",
                        "persistent_keep_alive":"25","allowed_ips":["0.0.0.0/0"]})
-        payload = guest_payload(endpoint, name, fields, native)
+        if admin_credentials is None:
+            payload = guest_payload(endpoint, name, fields, native)
+        else:
+            subnet = ipaddress.ip_network(cfg["subnet"])
+            admin_fields = dict(fields)
+            admin_fields.update({
+                "subnet_address": str(subnet.network_address),
+                "subnet_cidr": subnet.prefixlen,
+            })
+            payload = admin_payload(
+                admin_credentials.host,
+                admin_credentials.username,
+                admin_credentials.password,
+                admin_credentials.port,
+                admin_description or name,
+                admin_fields,
+                native,
+            )
         with self.db.connect() as db:
             db.execute("INSERT INTO peers(server_id,telegram_id,name,address,public_key) VALUES(?,?,?,?,?)", (server_id,uid,name,address,peer["public"]))
         return encode_vpn_url(payload)

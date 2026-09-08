@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS servers(
   host_key TEXT,
   endpoint TEXT NOT NULL,
   config_json TEXT NOT NULL,
+  admin_profile_issued_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS peers(
@@ -68,6 +69,9 @@ class Database:
             }:
                 db.execute("ALTER TABLE peers RENAME TO peers_legacy")
             db.executescript(SCHEMA)
+            server_columns = {r[1] for r in db.execute("PRAGMA table_info(servers)")}
+            if "admin_profile_issued_at" not in server_columns:
+                db.execute("ALTER TABLE servers ADD COLUMN admin_profile_issued_at TEXT")
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if "peers_legacy" in tables:
                 server = db.execute("SELECT id FROM servers ORDER BY id LIMIT 1").fetchone()

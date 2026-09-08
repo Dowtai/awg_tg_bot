@@ -13,7 +13,21 @@ class DatabaseTests(unittest.TestCase):
             with database.connect() as db:
                 columns = {row[1] for row in db.execute("PRAGMA table_info(peers)")}
                 self.assertIn("server_id", columns)
+                server_columns = {row[1] for row in db.execute("PRAGMA table_info(servers)")}
+                self.assertIn("admin_profile_issued_at", server_columns)
                 self.assertIsNotNone(db.execute("SELECT name FROM sqlite_master WHERE name='servers'").fetchone())
+
+    def test_adds_admin_profile_marker_to_existing_multiserver_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bot.sqlite3"
+            db = sqlite3.connect(path)
+            db.execute("CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT)")
+            db.commit()
+            db.close()
+            Database(path)
+            with sqlite3.connect(path) as migrated:
+                columns = {row[1] for row in migrated.execute("PRAGMA table_info(servers)")}
+                self.assertIn("admin_profile_issued_at", columns)
 
     def test_migrates_single_server_database(self):
         with tempfile.TemporaryDirectory() as directory:
